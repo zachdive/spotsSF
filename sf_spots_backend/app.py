@@ -28,20 +28,53 @@ engine = create_engine(DATABASE_URL) if DATABASE_URL else None
 # WebSocket connection manager
 class ConnectionManager:
     def __init__(self):
-        self.active_connections: list[WebSocket] = []
+        self.active_connections: dict[int, list[WebSocket]] = {}  # workspace_id -> list of connections
 
-    async def connect(self, websocket: WebSocket):
+    async def connect(self, websocket: WebSocket, workspace_id: int):
         await websocket.accept()
-        self.active_connections.append(websocket)
+        if workspace_id not in self.active_connections:
+            self.active_connections[workspace_id] = []
+        self.active_connections[workspace_id].append(websocket)
 
-    def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
+    def disconnect(self, websocket: WebSocket, workspace_id: int):
+        if workspace_id in self.active_connections:
+            self.active_connections[workspace_id].remove(websocket)
+            if not self.active_connections[workspace_id]:
+                del self.active_connections[workspace_id]
 
-    async def broadcast(self, message: str):
-        for connection in self.active_connections:
-            await connection.send_text(message)
+    async def broadcast_to_workspace(self, workspace_id: int, message: dict):
+        if workspace_id in self.active_connections:
+            for connection in self.active_connections[workspace_id]:
+                await connection.send_json(message)
 
 manager = ConnectionManager()
+
+async def update_workspace_occupancy(workspace_id: int, available_spots: int):
+    """Update workspace occupancy in database"""
+    if not engine:
+        return {"error": "Database connection not configured"}
+
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(
+                text("""
+                    UPDATE workspaces
+                    SET available_spots = :spots
+                    WHERE id = :id
+                    RETURNING available_spots, total_spots
+                """),
+                {"id": workspace_id, "spots": available_spots}
+            ).first()
+
+            if result:
+                return {
+                    "workspace_id": workspace_id,
+                    "availableSpots": result[0],
+                    "totalSpots": result[1]
+                }
+            return {"error": "Workspace not found"}
+    except Exception as e:
+        return {"error": f"Database error: {str(e)}"}
 
 @app.get("/healthz")
 async def health_check():
@@ -51,11 +84,11 @@ async def health_check():
 async def get_workspaces():
     if not engine:
         return {"error": "Database connection not configured"}
-    
+
     try:
         with engine.connect() as conn:
             result = conn.execute(text("""
-                SELECT id, name, address, latitude, longitude, available_spots, total_spots 
+                SELECT id, name, address, latitude, longitude, available_spots, total_spots
                 FROM workspaces
             """))
             workspaces = [
@@ -78,14 +111,14 @@ async def get_workspaces():
 async def get_workspace_occupancy(workspace_id: int):
     if not engine:
         return {"error": "Database connection not configured"}
-    
+
     try:
         with engine.connect() as conn:
             result = conn.execute(
                 text("SELECT available_spots, total_spots FROM workspaces WHERE id = :id"),
                 {"id": workspace_id}
             ).first()
-            
+
             if result:
                 return {
                     "availableSpots": result[0],
@@ -95,15 +128,39 @@ async def get_workspace_occupancy(workspace_id: int):
     except Exception as e:
         return {"error": f"Database error: {str(e)}"}
 
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    await manager.connect(websocket)
+@app.websocket("/ws/{workspace_id}")
+async def workspace_updates(websocket: WebSocket, workspace_id: int):
+    await manager.connect(websocket, workspace_id)
     try:
         while True:
-            data = await websocket.receive_text()
-            await manager.broadcast(data)
+            data = await websocket.receive_json()
+
+            # Validate workspace_id matches
+            if data.get("workspace_id") != workspace_id:
+                await websocket.send_json({"error": "Invalid workspace_id"})
+                continue
+
+            # Validate available_spots
+            available_spots = data.get("available_spots")
+            if not isinstance(available_spots, int):
+                await websocket.send_json({"error": "Invalid available_spots value"})
+                continue
+
+            # Update database and get current state
+            result = await update_workspace_occupancy(workspace_id, available_spots)
+
+            if "error" in result:
+                await websocket.send_json(result)
+                continue
+
+            # Broadcast to all connected clients for this workspace
+            await manager.broadcast_to_workspace(workspace_id, result)
+
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
+        manager.disconnect(websocket, workspace_id)
+    except Exception as e:
+        await websocket.send_json({"error": f"Unexpected error: {str(e)}"})
+        manager.disconnect(websocket, workspace_id)
 
 if __name__ == "__main__":
     import uvicorn
